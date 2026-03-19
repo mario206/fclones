@@ -11,6 +11,39 @@ use crate::dedupe::{FsCommand, PathAndMetadata};
 use crate::log::{Log, LogExt};
 use crate::config::ReflinkMode;
 
+/// Represents a source file for deduplication.
+///
+/// A source can be either a named file on disk (with a path) or an anonymous
+/// file descriptor created via `O_TMPFILE` (no directory entry, kernel auto-cleans
+/// on process exit).
+#[derive(Clone)]
+enum SrcFile {
+    /// A named file on disk, identified by path.
+    Named(PathBuf),
+    /// An anonymous file created via O_TMPFILE + FICLONE.
+    /// Has no directory entry; the kernel reclaims it when all fds are closed
+    /// (including on SIGKILL, OOM kill, etc.).
+    Anonymous(Arc<fs::File>),
+}
+
+impl std::fmt::Debug for SrcFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SrcFile::Named(p) => write!(f, "Named({})", p.display()),
+            SrcFile::Anonymous(_) => write!(f, "Anonymous(O_TMPFILE)"),
+        }
+    }
+}
+
+impl std::fmt::Display for SrcFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SrcFile::Named(p) => write!(f, "{}", p.display()),
+            SrcFile::Anonymous(_) => write!(f, "<anonymous O_TMPFILE>"),
+        }
+    }
+}
+
 /// A shared queue for tree-shaped deduplication.
 ///
 /// In safe mode (FIDEDUPERANGE), the kernel acquires i_rwsem on the src file,
@@ -24,6 +57,10 @@ use crate::config::ReflinkMode;
 /// 3. After successful FIDEDUPERANGE, both src and dest are put back into the queue.
 /// 4. After failure, only src is put back.
 /// 5. Workers signal completion; when all are done, remaining waiters are unblocked.
+///
+/// When prefab is enabled, `O_TMPFILE` anonymous files are used as pre-fabricated
+/// src copies. These have no directory entry, so the kernel automatically reclaims
+/// them when the process exits (even via SIGKILL), requiring no manual cleanup.
 pub struct DedupeQueue {
     inner: Mutex<DedupeQueueInner>,
     condvar: Condvar,
@@ -36,28 +73,63 @@ impl std::fmt::Debug for DedupeQueue {
             .field("queue_len", &inner.queue.len())
             .field("total_workers", &inner.total_workers)
             .field("completed_workers", &inner.completed_workers)
+            .field("prefab_pending", &inner.prefab_pending)
             .finish()
     }
 }
 
 struct DedupeQueueInner {
-    queue: VecDeque<PathBuf>,
+    queue: VecDeque<SrcFile>,
     /// Total number of workers that will use this queue
     total_workers: usize,
     /// Number of workers that have completed
     completed_workers: usize,
+    /// Number of prefab O_TMPFILE copies still to be created (0 = no prefab)
+    prefab_pending: usize,
+    /// Path to the retained file (used as FICLONE source for prefab)
+    retained_path: PathBuf,
 }
 
 impl DedupeQueue {
     /// Create a new queue with the retained file as the initial src.
+    /// No pre-fabrication; parallelism grows via tree-shaped approach.
     pub fn new(retained: PathBuf, total_workers: usize) -> Self {
         let mut queue = VecDeque::new();
-        queue.push_back(retained);
+        let retained_clone = retained.clone();
+        queue.push_back(SrcFile::Named(retained));
         Self {
             inner: Mutex::new(DedupeQueueInner {
                 queue,
                 total_workers,
                 completed_workers: 0,
+                prefab_pending: 0,
+                retained_path: retained_clone,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Create a new queue with pre-fabrication enabled.
+    ///
+    /// The queue starts with the retained file. On the first call to
+    /// `prefab_if_needed()`, the caller creates `total_workers` anonymous
+    /// O_TMPFILE + FICLONE copies of the retained file, so all workers can
+    /// start deduplication in parallel from the first round.
+    ///
+    /// The anonymous files have no directory entry and are automatically
+    /// reclaimed by the kernel when all file descriptors are closed (including
+    /// on abnormal exit such as SIGKILL or OOM kill).
+    pub fn new_with_prefab(retained: PathBuf, total_workers: usize) -> Self {
+        let mut queue = VecDeque::new();
+        let retained_clone = retained.clone();
+        queue.push_back(SrcFile::Named(retained));
+        Self {
+            inner: Mutex::new(DedupeQueueInner {
+                queue,
+                total_workers,
+                completed_workers: 0,
+                prefab_pending: total_workers,
+                retained_path: retained_clone,
             }),
             condvar: Condvar::new(),
         }
@@ -66,8 +138,8 @@ impl DedupeQueue {
     /// Take an available src from the queue.
     /// Blocks if the queue is empty and there are still active workers.
     /// Returns None if all workers have completed and the queue is empty.
-    /// On success, returns (src_path, remaining_queue_length).
-    fn take(&self) -> Option<(PathBuf, usize)> {
+    /// On success, returns (src_file, remaining_queue_length).
+    fn take(&self) -> Option<(SrcFile, usize)> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(src) = inner.queue.pop_front() {
@@ -82,12 +154,83 @@ impl DedupeQueue {
         }
     }
 
-    /// Put src back and optionally add a successfully deduped dest.
-    fn put_back(&self, src: PathBuf, dest: Option<PathBuf>) {
+    /// Execute pre-fabrication if pending. Should be called by workers before `take()`.
+    ///
+    /// The first worker to call this will use O_TMPFILE + FICLONE to create
+    /// anonymous copies of the retained file and add them to the queue.
+    /// Subsequent calls are no-ops.
+    ///
+    /// O_TMPFILE creates files with no directory entry, so:
+    /// - No filename pollution on disk
+    /// - Kernel auto-reclaims on process exit (even SIGKILL)
+    /// - No cleanup logic needed
+    ///
+    /// Returns the number of prefab files created, or an error.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn prefab_if_needed(&self, log: &dyn Log) -> io::Result<usize> {
+        let mut inner = self.inner.lock().unwrap();
+        let pending = inner.prefab_pending;
+        if pending == 0 {
+            return Ok(0);
+        }
+        // Reset pending to 0 so only the first caller does the work
+        inner.prefab_pending = 0;
+        let retained_path = inner.retained_path.clone();
+        // Drop lock before doing I/O
+        drop(inner);
+
+        log.verbose(format!(
+            "Prefab: creating {} O_TMPFILE + FICLONE copies of {}",
+            pending,
+            retained_path.display()
+        ));
+
+        let start_time = std::time::Instant::now();
+        let mut created: Vec<SrcFile> = Vec::new();
+        for i in 0..pending {
+            match create_anonymous_ficlone(&retained_path) {
+                Ok(file) => {
+                    created.push(SrcFile::Anonymous(Arc::new(file)));
+                }
+                Err(e) => {
+                    log.warn(format!(
+                        "Prefab: O_TMPFILE + FICLONE failed for copy {} of {}: {}. \
+                         Falling back to tree-shaped growth for remaining copies.",
+                        i,
+                        retained_path.display(),
+                        e
+                    ));
+                    // Stop creating more prefab copies on first failure
+                    break;
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        let count = created.len();
+        log.verbose(format!(
+            "Prefab: created {} anonymous FICLONE copies in {:.3}s",
+            count,
+            elapsed.as_secs_f64()
+        ));
+
+        // Add created anonymous files to queue
+        let mut inner = self.inner.lock().unwrap();
+        for src in created {
+            inner.queue.push_back(src);
+        }
+        // Notify waiting workers
+        self.condvar.notify_all();
+
+        Ok(count)
+    }
+
+    /// Put src back and optionally add a successfully deduped dest as a named src.
+    fn put_back(&self, src: SrcFile, dest: Option<PathBuf>) {
         let mut inner = self.inner.lock().unwrap();
         inner.queue.push_back(src);
         if let Some(d) = dest {
-            inner.queue.push_back(d);
+            inner.queue.push_back(SrcFile::Named(d));
         }
         // Notify all waiting workers that new src(s) are available
         self.condvar.notify_all();
@@ -102,6 +245,62 @@ impl DedupeQueue {
             self.condvar.notify_all();
         }
     }
+}
+
+/// Create an anonymous file via O_TMPFILE in the same directory as `src_path`,
+/// then FICLONE the content from `src_path` into it.
+///
+/// The returned File has no directory entry. When all references to it are dropped
+/// (or the process exits for any reason), the kernel automatically reclaims the space.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn create_anonymous_ficlone(src_path: &std::path::Path) -> io::Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    use std::os::unix::prelude::AsRawFd;
+    use nix::request_code_write;
+
+    // O_TMPFILE requires a directory path; use the parent of the src file
+    // to ensure the anonymous file is on the same filesystem (required for FICLONE).
+    let dir = src_path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "src_path has no parent directory")
+    })?;
+    let dir_cstr = CString::new(dir.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, "directory path contains null byte")
+    })?;
+
+    // Create anonymous temporary file via O_TMPFILE
+    let anon_fd = unsafe {
+        libc::open(dir_cstr.as_ptr(), libc::O_TMPFILE | libc::O_RDWR, 0o600)
+    };
+    if anon_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let anon_file = unsafe { fs::File::from_raw_fd(anon_fd) };
+
+    // Open the source file for FICLONE
+    let src_file = fs::File::open(src_path)?;
+
+    // FICLONE: clone src content into the anonymous file
+    // From /usr/include/linux/fs.h:
+    // #define FICLONE _IOW(0x94, 9, int)
+    const FICLONE_TYPE: u8 = 0x94;
+    const FICLONE_NR: u8 = 9;
+    const FICLONE_SIZE: usize = std::mem::size_of::<libc::c_int>();
+
+    let ret = unsafe {
+        libc::ioctl(
+            anon_file.as_raw_fd(),
+            request_code_write!(FICLONE_TYPE, FICLONE_NR, FICLONE_SIZE),
+            src_file.as_raw_fd(),
+        )
+    };
+
+    if ret == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(anon_file)
 }
 
 /// Format byte size into human-readable string (B / MB / GB)
@@ -272,13 +471,24 @@ fn linux_reflink_safe(
     let std_link = dest.path.to_path_buf();
 
     if let Some(q) = queue {
+        // If prefab is pending, the first worker to arrive will create
+        // O_TMPFILE + FICLONE copies of the retained file, filling the queue
+        // so all workers can start in parallel.
+        if let Err(e) = q.prefab_if_needed(log) {
+            log.warn(format!(
+                "Prefab failed, falling back to tree-shaped growth: {}",
+                e
+            ));
+        }
+
         // Tree-shaped deduplication: take an available src from the shared queue.
-        // This src may be the original retained file or any previously deduped file.
+        // This src may be the original retained file (Named), an anonymous
+        // O_TMPFILE prefab copy (Anonymous), or a previously deduped file (Named).
         let actual_src = match q.take() {
             Some((s, remaining)) => {
                 log.verbose(format!(
                     "DedupeQueue: took src={}, dest={}, remaining_in_queue={}",
-                    s.display(),
+                    s,
                     std_link.display(),
                     remaining
                 ));
@@ -295,7 +505,14 @@ fn linux_reflink_safe(
             }
         };
 
-        let result = reflink_overwrite_dedupe(&actual_src, &std_link, trust_fast_reflinked_check, log);
+        let result = match &actual_src {
+            SrcFile::Named(path) => {
+                reflink_overwrite_dedupe(path, &std_link, trust_fast_reflinked_check, log)
+            }
+            SrcFile::Anonymous(file) => {
+                reflink_overwrite_dedupe_fd(file, &std_link, trust_fast_reflinked_check, log)
+            }
+        };
 
         match &result {
             Ok(()) => {
@@ -561,7 +778,153 @@ fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path, tr
     Ok(())
 }
 
-/// Restores file owner and group
+/// FIDEDUPERANGE using an already-open src file descriptor.
+///
+/// This is used for anonymous O_TMPFILE prefab copies which have no path.
+/// The `trust_fast_reflinked_check` (FIEMAP) pre-check is skipped because
+/// anonymous files cannot be checked via path-based FIEMAP.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reflink_overwrite_dedupe_fd(
+    src_file: &fs::File,
+    link: &std::path::Path,
+    _trust_fast_reflinked_check: bool,
+    log: &dyn Log,
+) -> io::Result<()> {
+    use nix::request_code_readwrite;
+    use std::mem::{size_of, zeroed};
+    use std::os::unix::prelude::AsRawFd;
+
+    // Note: trust_fast_reflinked_check is intentionally ignored for anonymous files,
+    // because FIEMAP-based extent comparison requires file paths (not fds).
+    // Anonymous prefab files are freshly created FICLONE copies, so they are
+    // guaranteed to not already be deduplicated with the dest.
+
+    let src_metadata = src_file.metadata()?;
+    let src_size = src_metadata.len();
+
+    let start_time = std::time::Instant::now();
+
+    log.verbose(format!(
+        "Safe dedup: <anonymous O_TMPFILE> -> {} ({})",
+        link.display(),
+        format_size(src_size)
+    ));
+
+    let dest = fs::OpenOptions::new()
+        .create(false)
+        .truncate(false)
+        .write(true)
+        .open(link)?;
+
+    let dest_metadata = dest.metadata()?;
+    let dest_size = dest_metadata.len();
+    if src_size != dest_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "File sizes differ (source={} bytes, dest={} bytes), cannot deduplicate with FIDEDUPERANGE",
+                src_size, dest_size
+            ),
+        ));
+    }
+
+    const FIDEDUPERANGE_TYPE: u8 = 0x94;
+    const FIDEDUPERANGE_NR: u8 = 54;
+    const FILE_DEDUPE_RANGE_DIFFERS: i32 = 1;
+
+    #[repr(C)]
+    struct FileDedupRangeInfo {
+        dest_fd: i64,
+        dest_offset: u64,
+        bytes_deduped: u64,
+        status: i32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    struct FileDedupRangeHeader {
+        src_offset: u64,
+        src_length: u64,
+        dest_count: u16,
+        reserved1: u16,
+        reserved2: u32,
+    }
+
+    #[repr(C)]
+    struct FileDedupRange {
+        src_offset: u64,
+        src_length: u64,
+        dest_count: u16,
+        reserved1: u16,
+        reserved2: u32,
+        info: [FileDedupRangeInfo; 1],
+    }
+
+    const FIDEDUPERANGE_SIZE: usize = size_of::<FileDedupRangeHeader>();
+
+    let mut offset: u64 = 0;
+
+    while offset < src_size {
+        let mut dedupe_range: FileDedupRange = unsafe { zeroed() };
+
+        dedupe_range.src_offset = offset;
+        dedupe_range.src_length = src_size - offset;
+        dedupe_range.dest_count = 1;
+        dedupe_range.reserved1 = 0;
+        dedupe_range.reserved2 = 0;
+
+        dedupe_range.info[0].dest_fd = i64::from(dest.as_raw_fd());
+        dedupe_range.info[0].dest_offset = offset;
+        dedupe_range.info[0].bytes_deduped = 0;
+        dedupe_range.info[0].status = 0;
+        dedupe_range.info[0].reserved = 0;
+
+        let ret = unsafe {
+            libc::ioctl(
+                src_file.as_raw_fd(),
+                request_code_readwrite!(FIDEDUPERANGE_TYPE, FIDEDUPERANGE_NR, FIDEDUPERANGE_SIZE)
+                    as libc::c_ulong,
+                &mut dedupe_range,
+            )
+        };
+
+        #[allow(clippy::if_same_then_else)]
+        if ret == -1 {
+            let err = io::Error::last_os_error();
+            let code = err.raw_os_error().unwrap();
+            if code == libc::EOPNOTSUPP {
+                // Filesystem does not support reflinks
+            } else if code == libc::EINVAL {
+                // Source filesize was larger than destination
+            }
+            return Err(err);
+        }
+
+        if dedupe_range.info[0].status == FILE_DEDUPE_RANGE_DIFFERS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "File contents differ, cannot deduplicate",
+            ));
+        }
+
+        let bytes_deduped = dedupe_range.info[0].bytes_deduped;
+        if bytes_deduped == 0 {
+            break;
+        }
+
+        offset += bytes_deduped;
+    }
+
+    let elapsed = start_time.elapsed();
+    log.verbose(format!(
+        "Safe dedup done: <anonymous O_TMPFILE> -> {} ({}) in {:.3}s",
+        link.display(),
+        format_size(src_size),
+        elapsed.as_secs_f64()
+    ));
+
+    Ok(())
+}
 #[cfg(unix)]
 fn restore_owner(path: &std::path::Path, metadata: &Metadata) -> io::Result<()> {
     use file_owner::PathExt;

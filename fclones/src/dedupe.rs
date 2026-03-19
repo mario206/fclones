@@ -725,6 +725,7 @@ where
 
 #[derive(Debug)]
 pub struct PartitionedFileGroup {
+    pub file_len: FileLen,
     pub to_keep: Vec<PathAndMetadata>,
     pub to_drop: Vec<PathAndMetadata>,
 }
@@ -750,7 +751,12 @@ impl PartitionedFileGroup {
     }
 
     /// Returns a list of commands that would remove redundant files in this group when executed.
-    pub fn dedupe_script(mut self, strategy: &DedupeOp, devices: &DiskDevices) -> Vec<FsCommand> {
+    pub fn dedupe_script(
+        mut self,
+        strategy: &DedupeOp,
+        devices: &DiskDevices,
+        prefab_src_threshold: Option<FileLen>,
+    ) -> Vec<FsCommand> {
         if self.to_drop.is_empty() {
             return vec![];
         }
@@ -765,13 +771,27 @@ impl PartitionedFileGroup {
         // concurrent deduplication. The queue starts with only the retained file;
         // as each dest is successfully deduped, it becomes a new potential src,
         // allowing parallelism to grow exponentially (1 → 2 → 4 → 8 → ...).
+        //
+        // If prefab_src_with_threshold is set and file_len >= threshold,
+        // pre-fabricate temporary FICLONE copies of the retained file (one per dest)
+        // so all workers can start in parallel from the first round.
         let reflink_queue = match strategy {
             DedupeOp::RefLink(Some(crate::config::ReflinkMode::Safe)) => {
                 let total_workers = self.to_drop.len();
-                Some(Arc::new(DedupeQueue::new(
-                    retained_file.path.to_path_buf(),
-                    total_workers,
-                )))
+                let should_prefab = prefab_src_threshold
+                    .map(|t| self.file_len >= t)
+                    .unwrap_or(false);
+                if should_prefab {
+                    Some(Arc::new(DedupeQueue::new_with_prefab(
+                        retained_file.path.to_path_buf(),
+                        total_workers,
+                    )))
+                } else {
+                    Some(Arc::new(DedupeQueue::new(
+                        retained_file.path.to_path_buf(),
+                        total_workers,
+                    )))
+                }
             }
             _ => None,
         };
@@ -914,6 +934,7 @@ fn partition(
 
     assert!(to_retain.len() >= n || to_drop.is_empty());
     Ok(PartitionedFileGroup {
+        file_len,
         to_keep: to_retain.into_iter().flat_map(|g| g.files).collect(),
         to_drop: to_drop.into_iter().flat_map(|g| g.files).collect(),
     })
@@ -973,7 +994,7 @@ where
                 for group in groups {
                     match partition(group, config, log) {
                         Ok(group) => {
-                            let mut cmds = group.dedupe_script(&op, &devices);
+                            let mut cmds = group.dedupe_script(&op, &devices, config.prefab_src_with_threshold);
                             if config.trust_fast_reflinked_check.unwrap_or(false) {
                                 for cmd in cmds.iter_mut() {
                                     cmd.set_trust_fast_reflinked_check(true);

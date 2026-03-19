@@ -694,6 +694,25 @@ pub struct DedupeConfig {
     /// When set to `false`, FIDEDUPERANGE is always invoked unconditionally.
     #[arg(long, value_name = "BOOL", num_args = 1)]
     pub trust_fast_reflinked_check: Option<bool>,
+
+    /// Pre-fabricate src files using FICLONE for groups with file size >= threshold (Linux only).
+    ///
+    /// When using `--reflink-mode safe`, the kernel's FIDEDUPERANGE ioctl acquires an
+    /// exclusive lock on the src file, serializing all dedup operations sharing the same src.
+    /// For large files, this creates a bottleneck during the initial "cold start" phase
+    /// where only one src is available.
+    ///
+    /// When this option is set with a byte threshold, for any group whose file size is
+    /// at or above the threshold, temporary FICLONE copies of the retained file are
+    /// pre-created (one per dest file). This allows all workers to start deduplication
+    /// in parallel from the first round, instead of waiting for the tree-shaped growth.
+    ///
+    /// The value is in bytes. Units like KB, KiB, MB, MiB, GB, GiB are supported.
+    /// If this option is not specified, no pre-fabrication is performed.
+    ///
+    /// Example: `--prefab-src-with-threshold 10MB`
+    #[arg(long, value_name = "BYTES")]
+    pub prefab_src_with_threshold: Option<FileLen>,
 }
 
 #[derive(clap::Subcommand, Debug)]
