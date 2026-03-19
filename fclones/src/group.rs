@@ -1203,6 +1203,7 @@ fn group_by_contents(
 ///
 /// # Example
 /// ```
+/// use chrono::Local;
 /// use fclones::log::StdLog;
 /// use fclones::config::GroupConfig;
 /// use fclones::Path;
@@ -1212,11 +1213,12 @@ fn group_by_contents(
 /// let mut config = GroupConfig::default();
 /// config.paths = vec![Path::from("/path/to/a/dir")];
 ///
+/// let start_time = Local::now();
 /// let groups = group_files(&config, &log).unwrap();
 /// println!("Found {} groups: ", groups.len());
 ///
 /// // print standard fclones report to stdout:
-/// write_report(&config, &log, &groups).unwrap();
+/// write_report(&config, &log, &groups, start_time).unwrap();
 /// ```
 pub fn group_files(config: &GroupConfig, log: &dyn Log) -> Result<Vec<FileGroup<FileInfo>>, Error> {
     let spinner = log.progress_bar("Initializing", ProgressBarLength::Unknown);
@@ -1270,9 +1272,8 @@ pub fn write_report(
     config: &GroupConfig,
     log: &dyn Log,
     groups: &[FileGroup<FileInfo>],
+    start_time: DateTime<Local>,
 ) -> io::Result<()> {
-    let now = Local::now();
-
     let total_count = file_count(groups.iter());
     let total_size = total_size(groups.iter());
 
@@ -1286,7 +1287,7 @@ pub fn write_report(
     });
 
     let header = ReportHeader {
-        timestamp: DateTime::from_naive_utc_and_offset(now.naive_utc(), *now.offset()),
+        timestamp: DateTime::from_naive_utc_and_offset(start_time.naive_utc(), *start_time.offset()),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         command: args_os().map(Arg::from).collect(),
         base_dir: config.base_dir.clone(),
@@ -1958,8 +1959,9 @@ mod test {
                 ..GroupConfig::default()
             };
 
+            let start_time = Local::now();
             let results = group_files(&config, &log).unwrap();
-            write_report(&config, &log, &results).unwrap();
+            write_report(&config, &log, &results, start_time).unwrap();
 
             assert!(report_file.exists());
             let mut report = String::new();

@@ -116,9 +116,10 @@ fn run_group(mut config: GroupConfig, log: &dyn Log) -> Result<(), Error> {
     check_can_create_output_file(&config)?;
     configure_main_thread_pool(&config.thread_pool_sizes());
     log.info("Started grouping");
+    let start_time = chrono::Local::now();
     let results = group_files(&config, log).map_err(|e| Error::new(e.message))?;
 
-    write_report(&config, log, &results)
+    write_report(&config, log, &results, start_time)
         .map_err(|e| Error::new(format!("Failed to write report: {e}")))
 }
 
