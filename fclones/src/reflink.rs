@@ -1,12 +1,108 @@
 use std::fs;
 use std::fs::Metadata;
 use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Condvar, Mutex};
+use std::collections::VecDeque;
 
 use filetime::FileTime;
 
 use crate::dedupe::{FsCommand, PathAndMetadata};
 use crate::log::{Log, LogExt};
 use crate::config::ReflinkMode;
+
+/// A shared queue for tree-shaped deduplication.
+///
+/// In safe mode (FIDEDUPERANGE), the kernel acquires i_rwsem on the src file,
+/// which serializes all dedup operations sharing the same src. This queue allows
+/// completed dest files to become new src candidates, enabling concurrent dedup
+/// with exponentially growing parallelism.
+///
+/// Flow:
+/// 1. Queue starts with only the retained file.
+/// 2. Each worker takes a src from the queue (blocks if empty).
+/// 3. After successful FIDEDUPERANGE, both src and dest are put back into the queue.
+/// 4. After failure, only src is put back.
+/// 5. Workers signal completion; when all are done, remaining waiters are unblocked.
+pub struct DedupeQueue {
+    inner: Mutex<DedupeQueueInner>,
+    condvar: Condvar,
+}
+
+impl std::fmt::Debug for DedupeQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock().unwrap();
+        f.debug_struct("DedupeQueue")
+            .field("queue_len", &inner.queue.len())
+            .field("total_workers", &inner.total_workers)
+            .field("completed_workers", &inner.completed_workers)
+            .finish()
+    }
+}
+
+struct DedupeQueueInner {
+    queue: VecDeque<PathBuf>,
+    /// Total number of workers that will use this queue
+    total_workers: usize,
+    /// Number of workers that have completed
+    completed_workers: usize,
+}
+
+impl DedupeQueue {
+    /// Create a new queue with the retained file as the initial src.
+    pub fn new(retained: PathBuf, total_workers: usize) -> Self {
+        let mut queue = VecDeque::new();
+        queue.push_back(retained);
+        Self {
+            inner: Mutex::new(DedupeQueueInner {
+                queue,
+                total_workers,
+                completed_workers: 0,
+            }),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Take an available src from the queue.
+    /// Blocks if the queue is empty and there are still active workers.
+    /// Returns None if all workers have completed and the queue is empty.
+    /// On success, returns (src_path, remaining_queue_length).
+    fn take(&self) -> Option<(PathBuf, usize)> {
+        let mut inner = self.inner.lock().unwrap();
+        loop {
+            if let Some(src) = inner.queue.pop_front() {
+                let remaining = inner.queue.len();
+                return Some((src, remaining));
+            }
+            // If all workers are done, no more src will be added
+            if inner.completed_workers >= inner.total_workers {
+                return None;
+            }
+            inner = self.condvar.wait(inner).unwrap();
+        }
+    }
+
+    /// Put src back and optionally add a successfully deduped dest.
+    fn put_back(&self, src: PathBuf, dest: Option<PathBuf>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.queue.push_back(src);
+        if let Some(d) = dest {
+            inner.queue.push_back(d);
+        }
+        // Notify all waiting workers that new src(s) are available
+        self.condvar.notify_all();
+    }
+
+    /// Mark a worker as completed. When all workers are done, wake up any
+    /// remaining waiters so they can exit.
+    fn mark_completed(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.completed_workers += 1;
+        if inner.completed_workers >= inner.total_workers {
+            self.condvar.notify_all();
+        }
+    }
+}
 
 /// Format byte size into human-readable string (B / MB / GB)
 fn format_size(bytes: u64) -> String {
@@ -34,6 +130,7 @@ pub fn reflink(
     src: &PathAndMetadata,
     dest: &PathAndMetadata,
     mode: Option<ReflinkMode>,
+    queue: Option<&Arc<DedupeQueue>>,
     log: &dyn Log,
 ) -> io::Result<()> {
     // Remember original metadata of the parent directory:
@@ -61,7 +158,7 @@ pub fn reflink(
                         return restore_metadata(&dest_path_buf, &dest.metadata, Restore::TimestampOnly);
                     }
                     ReflinkMode::Safe => {
-                        linux_reflink_safe(src, dest, log)?;
+                        linux_reflink_safe(src, dest, queue, log)?;
                         // FIDEDUPERANGE does not modify mtime, so no need to restore it
                         return Ok(());
                     }
@@ -75,6 +172,7 @@ pub fn reflink(
 
         // Suppress unused variable warning on non-Linux platforms
         let _ = mode;
+        let _ = queue;
 
         safe_reflink(src, dest, log)?;
 
@@ -162,12 +260,57 @@ fn linux_reflink_fast(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn L
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn linux_reflink_safe(src: &PathAndMetadata, dest: &PathAndMetadata, log: &dyn Log) -> io::Result<()> {
-    let fs_target = src.path.to_path_buf();
+fn linux_reflink_safe(
+    src: &PathAndMetadata,
+    dest: &PathAndMetadata,
+    queue: Option<&Arc<DedupeQueue>>,
+    log: &dyn Log,
+) -> io::Result<()> {
     let std_link = dest.path.to_path_buf();
 
-    // Use FIDEDUPERANGE (verifies content identity before deduplication)
-    reflink_overwrite_dedupe(&fs_target, &std_link, log)
+    if let Some(q) = queue {
+        // Tree-shaped deduplication: take an available src from the shared queue.
+        // This src may be the original retained file or any previously deduped file.
+        let actual_src = match q.take() {
+            Some((s, remaining)) => {
+                log.verbose(format!(
+                    "DedupeQueue: took src={}, dest={}, remaining_in_queue={}",
+                    s.display(),
+                    std_link.display(),
+                    remaining
+                ));
+                s
+            }
+            None => {
+                // All workers completed and queue is empty - should not happen
+                // in normal flow, but handle gracefully.
+                q.mark_completed();
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "DedupeQueue exhausted unexpectedly",
+                ));
+            }
+        };
+
+        let result = reflink_overwrite_dedupe(&actual_src, &std_link, log);
+
+        match &result {
+            Ok(()) => {
+                // Success: put src back and add dest as a new potential src
+                q.put_back(actual_src, Some(std_link));
+            }
+            Err(_) => {
+                // Failure: put src back but don't add dest
+                q.put_back(actual_src, None);
+            }
+        }
+        q.mark_completed();
+        result
+    } else {
+        // No queue: use original src directly (backward compatible)
+        let fs_target = src.path.to_path_buf();
+        reflink_overwrite_dedupe(&fs_target, &std_link, log)
+    }
 }
 
 /// Reflink `target` to `link` and expect these two files to be equally sized.
@@ -717,6 +860,7 @@ pub mod test {
                 target: Arc::new(file_1),
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
+                queue: None,
             };
 
             assert!(
@@ -766,6 +910,7 @@ pub mod test {
                 // Use Fast mode because files have different sizes;
                 // Safe mode (FIDEDUPERANGE) cannot handle different-sized files.
                 mode: Some(crate::config::ReflinkMode::Fast),
+                queue: None,
             };
 
             if via_ioctl {
@@ -822,6 +967,7 @@ pub mod test {
                 // Use Fast mode because files have different sizes;
                 // Safe mode (FIDEDUPERANGE) cannot handle different-sized files.
                 mode: Some(crate::config::ReflinkMode::Fast),
+                queue: None,
             };
             cmd.execute(true, &log).unwrap();
 
@@ -868,6 +1014,7 @@ pub mod test {
                 target: Arc::new(file_1),
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
+                queue: None,
             };
 
             // Safe mode should fail because files have different sizes
@@ -927,6 +1074,7 @@ pub mod test {
                 target: Arc::new(file_1),
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
+                queue: None,
             };
 
             // Safe mode should succeed with identical files
@@ -992,6 +1140,7 @@ pub mod test {
                 target: Arc::new(file_1),
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
+                queue: None,
             };
 
             // Safe mode should fail because files have different content (and size)
@@ -1101,6 +1250,7 @@ pub mod test {
                 target: Arc::new(file_1),
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
+                queue: None,
             };
 
             let result = cmd.execute(true, &log);

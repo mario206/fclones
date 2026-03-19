@@ -24,6 +24,7 @@ use crate::group::{FileGroup, FileSubGroup};
 use crate::lock::FileLock;
 use crate::log::{Log, LogExt};
 use crate::path::Path;
+use crate::reflink::DedupeQueue;
 use crate::util::{max_result, min_result, try_sort_by_key};
 use crate::{Error, TIMESTAMP_FMT};
 
@@ -117,6 +118,7 @@ pub enum FsCommand {
         target: Arc<PathAndMetadata>,
         link: PathAndMetadata,
         mode: Option<crate::config::ReflinkMode>,
+        queue: Option<Arc<DedupeQueue>>,
     },
 }
 
@@ -330,9 +332,9 @@ impl FsCommand {
                 Self::safe_remove(&link.path, |link| Self::hardlink(&target.path, link), log)?;
                 Ok(link.metadata.len())
             }
-            FsCommand::RefLink { target, link, mode } => {
+            FsCommand::RefLink { target, link, mode, queue } => {
                 let _ = Self::maybe_lock(&link.path, should_lock)?;
-                crate::reflink::reflink(target, link, *mode, log)?;
+                crate::reflink::reflink(target, link, *mode, queue.as_ref(), log)?;
                 Ok(link.metadata.len())
             }
             FsCommand::Move {
@@ -750,6 +752,22 @@ impl PartitionedFileGroup {
         );
         let mut commands = Vec::new();
         let retained_file = Arc::new(self.to_keep.swap_remove(0));
+
+        // For Safe reflink mode, create a shared queue to enable tree-shaped
+        // concurrent deduplication. The queue starts with only the retained file;
+        // as each dest is successfully deduped, it becomes a new potential src,
+        // allowing parallelism to grow exponentially (1 → 2 → 4 → 8 → ...).
+        let reflink_queue = match strategy {
+            DedupeOp::RefLink(Some(crate::config::ReflinkMode::Safe)) => {
+                let total_workers = self.to_drop.len();
+                Some(Arc::new(DedupeQueue::new(
+                    retained_file.path.to_path_buf(),
+                    total_workers,
+                )))
+            }
+            _ => None,
+        };
+
         for dropped_file in self.to_drop {
             match strategy {
                 DedupeOp::SymbolicLink => commands.push(FsCommand::SoftLink {
@@ -764,6 +782,7 @@ impl PartitionedFileGroup {
                     target: retained_file.clone(),
                     link: dropped_file,
                     mode: *mode,
+                    queue: reflink_queue.clone(),
                 }),
                 DedupeOp::Remove => commands.push(FsCommand::Remove { file: dropped_file }),
                 DedupeOp::Move(target_dir) => {
