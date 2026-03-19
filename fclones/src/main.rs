@@ -292,6 +292,16 @@ fn main() {
                 log.err("Command \"dedupe\" is unsupported on Windows");
                 exit(1);
             }
+            // When --reflink-mode safe is used, --trust-fast-reflinked-check must be explicitly set
+            if config.reflink_mode == Some(fclones::config::ReflinkMode::Safe)
+                && config.trust_fast_reflinked_check.is_none()
+            {
+                log.err(
+                    "When --reflink-mode safe is used, you must explicitly set \
+                     --trust-fast-reflinked-check true or --trust-fast-reflinked-check false.",
+                );
+                exit(1);
+            }
             run_dedupe(DedupeOp::RefLink(config.reflink_mode), config, &log)
         }
         Command::Move { config, target } => {
@@ -308,7 +318,7 @@ fn main() {
             use fclones::reflink_check::{fast_check_reflinked, CheckResult};
             let p1 = file1.to_string_lossy();
             let p2 = file2.to_string_lossy();
-            match fast_check_reflinked(&p1, &p2) {
+            match fast_check_reflinked(&p1, &p2, false) {
                 Ok(CheckResult::Reflinked(n)) => {
                     println!("YES ({} extents)", n);
                     Ok(())

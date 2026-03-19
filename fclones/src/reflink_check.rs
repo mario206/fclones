@@ -159,20 +159,22 @@ pub enum CheckResult {
 ///   practice this is near-impossible because the filesystem allocator will not
 ///   assign identical physical regions to two independently written files that
 ///   coexist at the same time.
-pub fn fast_check_reflinked(path1: &str, path2: &str) -> io::Result<CheckResult> {
+pub fn fast_check_reflinked(path1: &str, path2: &str, mute: bool) -> io::Result<CheckResult> {
     let f1 = File::open(path1)?;
     let f2 = File::open(path2)?;
 
     let ext1 = get_extents(f1.as_raw_fd())?;
     let ext2 = get_extents(f2.as_raw_fd())?;
 
-    // Print extent info
-    println!("extents: file1={}  file2={}", ext1.len(), ext2.len());
-    for (i, e) in ext1.iter().enumerate() {
-        println!("  f1[{}] {}", i, e);
-    }
-    for (i, e) in ext2.iter().enumerate() {
-        println!("  f2[{}] {}", i, e);
+    // Print extent info (suppressed when mute is true)
+    if !mute {
+        println!("extents: file1={}  file2={}", ext1.len(), ext2.len());
+        for (i, e) in ext1.iter().enumerate() {
+            println!("  f1[{}] {}", i, e);
+        }
+        for (i, e) in ext2.iter().enumerate() {
+            println!("  f2[{}] {}", i, e);
+        }
     }
 
     // Inline extents cannot be reflinked
@@ -300,13 +302,13 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
             match result {
                 CheckResult::Reflinked(n) => {
-                    assert!(n > 0, "Expected at least one shared extent");
-                    println!("OK: files share {} extent(s)", n);
+                    assert!(n > 0, "Expected at least one shared extent after read");                    println!("OK: files share {} extent(s)", n);
                 }
                 CheckResult::NotReflinked(reason) => {
                     panic!("Expected Reflinked, got NotReflinked: {}", reason);
@@ -337,6 +339,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -376,6 +379,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -413,6 +417,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -433,7 +438,7 @@ mod test {
 
     #[test]
     fn test_fast_check_reflinked_nonexistent_file() {
-        let result = fast_check_reflinked("/nonexistent/path/a", "/nonexistent/path/b");
+        let result = fast_check_reflinked("/nonexistent/path/a", "/nonexistent/path/b", false);
         assert!(result.is_err(), "Non-existent files should produce IO error");
     }
 
@@ -453,6 +458,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -496,6 +502,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -537,6 +544,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file2.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 
@@ -565,6 +573,7 @@ mod test {
             let result = fast_check_reflinked(
                 file1.to_str().unwrap(),
                 file1.to_str().unwrap(),
+                false,
             )
             .expect("fast_check_reflinked should not return an IO error");
 

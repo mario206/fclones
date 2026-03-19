@@ -131,6 +131,7 @@ pub fn reflink(
     dest: &PathAndMetadata,
     mode: Option<ReflinkMode>,
     queue: Option<&Arc<DedupeQueue>>,
+    trust_fast_reflinked_check: bool,
     log: &dyn Log,
 ) -> io::Result<()> {
     // Remember original metadata of the parent directory:
@@ -158,7 +159,7 @@ pub fn reflink(
                         return restore_metadata(&dest_path_buf, &dest.metadata, Restore::TimestampOnly);
                     }
                     ReflinkMode::Safe => {
-                        linux_reflink_safe(src, dest, queue, log)?;
+                        linux_reflink_safe(src, dest, queue, trust_fast_reflinked_check, log)?;
                         // FIDEDUPERANGE does not modify mtime, so no need to restore it
                         return Ok(());
                     }
@@ -173,6 +174,7 @@ pub fn reflink(
         // Suppress unused variable warning on non-Linux platforms
         let _ = mode;
         let _ = queue;
+        let _ = trust_fast_reflinked_check;
 
         safe_reflink(src, dest, log)?;
 
@@ -264,6 +266,7 @@ fn linux_reflink_safe(
     src: &PathAndMetadata,
     dest: &PathAndMetadata,
     queue: Option<&Arc<DedupeQueue>>,
+    trust_fast_reflinked_check: bool,
     log: &dyn Log,
 ) -> io::Result<()> {
     let std_link = dest.path.to_path_buf();
@@ -292,7 +295,7 @@ fn linux_reflink_safe(
             }
         };
 
-        let result = reflink_overwrite_dedupe(&actual_src, &std_link, log);
+        let result = reflink_overwrite_dedupe(&actual_src, &std_link, trust_fast_reflinked_check, log);
 
         match &result {
             Ok(()) => {
@@ -309,7 +312,7 @@ fn linux_reflink_safe(
     } else {
         // No queue: use original src directly (backward compatible)
         let fs_target = src.path.to_path_buf();
-        reflink_overwrite_dedupe(&fs_target, &std_link, log)
+        reflink_overwrite_dedupe(&fs_target, &std_link, trust_fast_reflinked_check, log)
     }
 }
 
@@ -360,10 +363,43 @@ fn reflink_overwrite(target: &std::path::Path, link: &std::path::Path) -> io::Re
 
 /// New implementation using FIDEDUPERANGE for safer deduplication
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path, log: &dyn Log) -> io::Result<()> {
+fn reflink_overwrite_dedupe(target: &std::path::Path, link: &std::path::Path, trust_fast_reflinked_check: bool, log: &dyn Log) -> io::Result<()> {
     use nix::request_code_readwrite;
     use std::mem::{size_of, zeroed};
     use std::os::unix::prelude::AsRawFd;
+
+    // If trust_fast_reflinked_check is enabled, use FIEMAP-based extent comparison
+    // to skip FIDEDUPERANGE when files already share all physical extents.
+    if trust_fast_reflinked_check {
+        use crate::reflink_check::{fast_check_reflinked, CheckResult};
+        match fast_check_reflinked(
+            target.to_str().unwrap_or_default(),
+            link.to_str().unwrap_or_default(),
+            true,
+        ) {
+            Ok(CheckResult::Reflinked(n)) if n > 0 => {
+                log.verbose(format!(
+                    "Skipping FIDEDUPERANGE: files already share {} extent(s) (fast_check_reflinked): {} -> {}",
+                    n,
+                    target.display(),
+                    link.display(),
+                ));
+                return Ok(());
+            }
+            Ok(_) => {
+                // Not reflinked or zero extents — proceed with FIDEDUPERANGE
+            }
+            Err(e) => {
+                // FIEMAP failed — log and fall through to FIDEDUPERANGE
+                log.verbose(format!(
+                    "fast_check_reflinked failed ({}), falling back to FIDEDUPERANGE: {} -> {}",
+                    e,
+                    target.display(),
+                    link.display(),
+                ));
+            }
+        }
+    }
 
     let src = fs::File::open(target)?;
     let src_metadata = src.metadata()?;
@@ -778,6 +814,7 @@ pub mod test {
         let result = fast_check_reflinked(
             path1.to_str().unwrap(),
             path2.to_str().unwrap(),
+            false,
         )
         .expect("fast_check_reflinked should not return an IO error");
         match result {
@@ -830,7 +867,7 @@ pub mod test {
 
             // Try FIDEDUPERANGE
             let test_log = StdLog::new();
-            let result = reflink_overwrite_dedupe(&source_path, &dest_path, &test_log);
+            let result = reflink_overwrite_dedupe(&source_path, &dest_path, false, &test_log);
 
             supported = match &result {
                 Err(e) => {
@@ -895,6 +932,7 @@ pub mod test {
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             assert!(
@@ -945,6 +983,7 @@ pub mod test {
                 // Safe mode (FIDEDUPERANGE) cannot handle different-sized files.
                 mode: Some(crate::config::ReflinkMode::Fast),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             if via_ioctl {
@@ -1002,6 +1041,7 @@ pub mod test {
                 // Safe mode (FIDEDUPERANGE) cannot handle different-sized files.
                 mode: Some(crate::config::ReflinkMode::Fast),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
             cmd.execute(true, &log).unwrap();
 
@@ -1049,6 +1089,7 @@ pub mod test {
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             // Safe mode should fail because files have different sizes
@@ -1109,6 +1150,7 @@ pub mod test {
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             // Safe mode should succeed with identical files
@@ -1178,6 +1220,7 @@ pub mod test {
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             // Safe mode should fail because files have different content (and size)
@@ -1288,6 +1331,7 @@ pub mod test {
                 link: file_2,
                 mode: Some(crate::config::ReflinkMode::Safe),
                 queue: None,
+                trust_fast_reflinked_check: false,
             };
 
             let result = cmd.execute(true, &log);

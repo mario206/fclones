@@ -119,6 +119,7 @@ pub enum FsCommand {
         link: PathAndMetadata,
         mode: Option<crate::config::ReflinkMode>,
         queue: Option<Arc<DedupeQueue>>,
+        trust_fast_reflinked_check: bool,
     },
 }
 
@@ -332,9 +333,9 @@ impl FsCommand {
                 Self::safe_remove(&link.path, |link| Self::hardlink(&target.path, link), log)?;
                 Ok(link.metadata.len())
             }
-            FsCommand::RefLink { target, link, mode, queue } => {
+            FsCommand::RefLink { target, link, mode, queue, trust_fast_reflinked_check } => {
                 let _ = Self::maybe_lock(&link.path, should_lock)?;
-                crate::reflink::reflink(target, link, *mode, queue.as_ref(), log)?;
+                crate::reflink::reflink(target, link, *mode, queue.as_ref(), *trust_fast_reflinked_check, log)?;
                 Ok(link.metadata.len())
             }
             FsCommand::Move {
@@ -374,6 +375,13 @@ impl FsCommand {
             | FsCommand::HardLink { link: file, .. }
             | FsCommand::RefLink { link: file, .. }
             | FsCommand::Move { source: file, .. } => file.metadata.len(),
+        }
+    }
+
+    /// Sets the trust_fast_reflinked_check flag on RefLink commands.
+    pub fn set_trust_fast_reflinked_check(&mut self, value: bool) {
+        if let FsCommand::RefLink { trust_fast_reflinked_check, .. } = self {
+            *trust_fast_reflinked_check = value;
         }
     }
 
@@ -783,6 +791,7 @@ impl PartitionedFileGroup {
                     link: dropped_file,
                     mode: *mode,
                     queue: reflink_queue.clone(),
+                    trust_fast_reflinked_check: false, // set by caller
                 }),
                 DedupeOp::Remove => commands.push(FsCommand::Remove { file: dropped_file }),
                 DedupeOp::Move(target_dir) => {
@@ -963,7 +972,15 @@ where
                 };
                 for group in groups {
                     match partition(group, config, log) {
-                        Ok(group) => commands.extend(group.dedupe_script(&op, &devices)),
+                        Ok(group) => {
+                            let mut cmds = group.dedupe_script(&op, &devices);
+                            if config.trust_fast_reflinked_check.unwrap_or(false) {
+                                for cmd in cmds.iter_mut() {
+                                    cmd.set_trust_fast_reflinked_check(true);
+                                }
+                            }
+                            commands.extend(cmds);
+                        }
                         Err(e) => log.warn(e),
                     }
                 }

@@ -679,6 +679,21 @@ pub struct DedupeConfig {
     /// - `safe`: Use FIDEDUPERANGE ioctl - verifies content identity before deduplication.
     #[arg(long, value_enum, value_name = "MODE")]
     pub reflink_mode: Option<ReflinkMode>,
+
+    /// Pre-check whether file pairs already share physical extents before
+    /// invoking FIDEDUPERANGE (Linux only).
+    ///
+    /// Must be explicitly set to `true` or `false` when `--reflink-mode safe` is used.
+    ///
+    /// When set to `true`, each file pair is pre-checked using FIEMAP
+    /// (fast_check_reflinked) before invoking the kernel's FIDEDUPERANGE ioctl.
+    /// If the files already share all physical extents, the expensive kernel
+    /// comparison is skipped entirely. This can significantly speed up repeated
+    /// deduplication runs.
+    ///
+    /// When set to `false`, FIDEDUPERANGE is always invoked unconditionally.
+    #[arg(long, value_name = "BOOL", num_args = 1)]
+    pub trust_fast_reflinked_check: Option<bool>,
 }
 
 #[derive(clap::Subcommand, Debug)]
