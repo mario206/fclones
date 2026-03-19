@@ -25,6 +25,8 @@ mod util;
 mod walk;
 
 pub use config::{DedupeConfig, GroupConfig, Priority};
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use config::ReflinkMode;
 pub use dedupe::{
     dedupe, log_script, run_script, sort_by_priority, DedupeOp, DedupeResult, PartitionedFileGroup,
     PathAndMetadata,

@@ -21,6 +21,7 @@ pub enum LogLevel {
     Info,
     Warn,
     Error,
+    Verbose,
 }
 
 /// Common interface for logging diagnostics and progress.
@@ -30,16 +31,21 @@ pub trait Log: Sync + Send {
 
     /// Logs a message.
     fn log(&self, level: LogLevel, msg: String);
+
+    /// Returns true if verbose logging is enabled.
+    fn is_verbose(&self) -> bool;
 }
 
 /// Additional convenience methods for logging.
 pub trait LogExt {
     /// Logs an info message.
     fn info(&self, msg: impl Display);
-    /// Logs an warning.
+    /// Logs a warning.
     fn warn(&self, msg: impl Display);
     /// Logs an error.
     fn err(&self, msg: impl Display);
+    /// Logs a verbose message (only shown when verbose mode is enabled).
+    fn verbose(&self, msg: impl Display);
 }
 
 /// Additional convenience methods for logging.
@@ -49,7 +55,7 @@ impl<L: Log + ?Sized> LogExt for L {
         self.log(LogLevel::Info, msg.to_string())
     }
 
-    /// Logs an warning.
+    /// Logs a warning.
     fn warn(&self, msg: impl Display) {
         self.log(LogLevel::Warn, msg.to_string())
     }
@@ -57,6 +63,11 @@ impl<L: Log + ?Sized> LogExt for L {
     /// Logs an error.
     fn err(&self, msg: impl Display) {
         self.log(LogLevel::Error, msg.to_string())
+    }
+
+    /// Logs a verbose message (only shown when verbose mode is enabled).
+    fn verbose(&self, msg: impl Display) {
+        self.log(LogLevel::Verbose, msg.to_string())
     }
 }
 
@@ -66,6 +77,7 @@ pub struct StdLog {
     progress_bar: Mutex<Weak<ProgressBar>>,
     pub log_stderr_to_stdout: bool,
     pub no_progress: bool,
+    pub verbose: bool,
 }
 
 impl StdLog {
@@ -80,6 +92,7 @@ impl StdLog {
                 .to_string(),
             log_stderr_to_stdout: false,
             no_progress: false,
+            verbose: false,
         }
     }
 
@@ -153,11 +166,15 @@ impl Log for StdLog {
     }
 
     fn log(&self, level: LogLevel, msg: String) {
+        if matches!(level, LogLevel::Verbose) && !self.verbose {
+            return;
+        }
         let timestamp = Local::now();
-        let level = match level {
+        let level_str = match level {
             LogLevel::Info => style(" info:").for_stderr().green(),
             LogLevel::Warn => style("warn:").for_stderr().yellow(),
             LogLevel::Error => style("error:").for_stderr().red(),
+            LogLevel::Verbose => style(" verbose:").for_stderr().cyan(),
         };
         let msg = format!(
             "{} {}: {} {}",
@@ -166,10 +183,14 @@ impl Log for StdLog {
                 .dim()
                 .white(),
             style(&self.program_name).for_stderr().yellow(),
-            level,
+            level_str,
             msg
         );
         self.eprintln(msg);
+    }
+
+    fn is_verbose(&self) -> bool {
+        self.verbose
     }
 }
 

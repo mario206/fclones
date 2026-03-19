@@ -548,6 +548,16 @@ impl GroupConfig {
     }
 }
 
+/// Reflink mode for deduplication on Linux.
+#[derive(Copy, Clone, Debug, Default, clap::ValueEnum, PartialEq, Eq)]
+pub enum ReflinkMode {
+    /// Use FICLONE ioctl - fast but does not verify content identity.
+    Fast,
+    /// Use FIDEDUPERANGE ioctl - safe, verifies content identity before deduplication.
+    #[default]
+    Safe,
+}
+
 /// Controls which files in a group should be removed / moved / replaced by links.
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
 pub enum Priority {
@@ -662,6 +672,13 @@ pub struct DedupeConfig {
     /// this flag is set automatically if `--transform` was used.
     #[arg(long)]
     pub no_check_size: bool,
+
+    /// Reflink mode for deduplication (Linux only).
+    ///
+    /// - `fast`: Use FICLONE ioctl - fast but does not verify content identity.
+    /// - `safe`: Use FIDEDUPERANGE ioctl - verifies content identity before deduplication.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub reflink_mode: Option<ReflinkMode>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -766,6 +783,13 @@ pub struct Config {
     // compatibility with fclones <= 0.34, overrides --progress
     #[arg(short('q'), long, hide = true)]
     pub quiet: bool,
+
+    /// Enable verbose logging.
+    ///
+    /// When enabled, additional diagnostic messages are printed to stderr,
+    /// which can be useful for debugging or understanding what the program is doing.
+    #[arg(short('v'), long, global = true)]
+    pub verbose: bool,
 
     /// Find files
     #[command(subcommand)]

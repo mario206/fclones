@@ -218,7 +218,7 @@ pub fn run_dedupe(op: DedupeOp, config: DedupeConfig, log: &dyn Log) -> Result<(
         .map(|g| g.unwrap())
         .inspect(|_| progress.inc(1));
 
-    let upto = if op == DedupeOp::RefLink {
+    let upto = if matches!(op, DedupeOp::RefLink(_)) {
         // Can't be sure because any previous deduplications are not
         // visible without calling fs-specific tooling.
         "up to "
@@ -269,6 +269,7 @@ fn main() {
         (_, "true") => false,
         (_, _auto) => !stderr().is_terminal(),
     };
+    log.verbose = config.verbose;
 
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -291,7 +292,7 @@ fn main() {
                 log.err("Command \"dedupe\" is unsupported on Windows");
                 exit(1);
             }
-            run_dedupe(DedupeOp::RefLink, config, &log)
+            run_dedupe(DedupeOp::RefLink(config.reflink_mode), config, &log)
         }
         Command::Move { config, target } => {
             let target = fclones::Path::from(target);

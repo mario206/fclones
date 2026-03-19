@@ -39,7 +39,10 @@ pub enum DedupeOp {
     /// Replaces redundant files with hard-links (ln on Unix).
     HardLink,
     /// Reflink redundant files (cp --reflink=always, only some filesystems).
-    RefLink,
+    /// On Linux, an optional mode can be specified:
+    /// - Fast: Use FICLONE ioctl - fast but does not verify content identity.
+    /// - Safe: Use FIDEDUPERANGE ioctl - verifies content identity before deduplication.
+    RefLink(Option<crate::config::ReflinkMode>),
 }
 
 /// Convenience struct for holding a path to a file and its metadata together
@@ -113,6 +116,7 @@ pub enum FsCommand {
     RefLink {
         target: Arc<PathAndMetadata>,
         link: PathAndMetadata,
+        mode: Option<crate::config::ReflinkMode>,
     },
 }
 
@@ -326,9 +330,9 @@ impl FsCommand {
                 Self::safe_remove(&link.path, |link| Self::hardlink(&target.path, link), log)?;
                 Ok(link.metadata.len())
             }
-            FsCommand::RefLink { target, link } => {
+            FsCommand::RefLink { target, link, mode } => {
                 let _ = Self::maybe_lock(&link.path, should_lock)?;
-                crate::reflink::reflink(target, link, log)?;
+                crate::reflink::reflink(target, link, *mode, log)?;
                 Ok(link.metadata.len())
             }
             FsCommand::Move {
@@ -756,9 +760,10 @@ impl PartitionedFileGroup {
                     target: retained_file.clone(),
                     link: dropped_file,
                 }),
-                DedupeOp::RefLink => commands.push(FsCommand::RefLink {
+                DedupeOp::RefLink(mode) => commands.push(FsCommand::RefLink {
                     target: retained_file.clone(),
                     link: dropped_file,
+                    mode: *mode,
                 }),
                 DedupeOp::Remove => commands.push(FsCommand::Remove { file: dropped_file }),
                 DedupeOp::Move(target_dir) => {
@@ -924,7 +929,7 @@ where
     P: Into<Path> + AsRef<Path> + fmt::Debug + Send + 'a,
 {
     let devices = DiskDevices::new(&HashMap::new());
-    let disallow_cross_device = op == DedupeOp::HardLink || op == DedupeOp::RefLink;
+    let disallow_cross_device = op == DedupeOp::HardLink || matches!(op, DedupeOp::RefLink(_));
     groups
         .into_iter()
         .enumerate()
