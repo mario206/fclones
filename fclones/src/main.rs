@@ -303,6 +303,23 @@ fn main() {
             generate_completions(shell, &mut std::io::stdout());
             Ok(())
         }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Command::ReflinkedCheck { file1, file2 } => {
+            use fclones::reflink_check::{fast_check_reflinked, CheckResult};
+            let p1 = file1.to_string_lossy();
+            let p2 = file2.to_string_lossy();
+            match fast_check_reflinked(&p1, &p2) {
+                Ok(CheckResult::Reflinked(n)) => {
+                    println!("YES ({} extents)", n);
+                    Ok(())
+                }
+                Ok(CheckResult::NotReflinked(reason)) => {
+                    println!("NO ({})", reason);
+                    exit(1);
+                }
+                Err(e) => Err(Error::new(format!("Reflink check failed: {}", e))),
+            }
+        }
     };
 
     if let Err(e) = result {

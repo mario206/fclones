@@ -16,6 +16,8 @@ mod path;
 mod pattern;
 mod phase;
 mod reflink;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub mod reflink_check;
 mod regex;
 mod rlimit;
 mod selector;

@@ -740,6 +740,8 @@ pub mod test {
 
     use super::*;
     use crate::file::{FileChunk, FileHash, FileLen, FilePos};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use crate::reflink_check::{fast_check_reflinked, CheckResult};
     use crate::hasher::FileHasher;
     use crate::hasher::HashFn;
     use crate::path::Path as FcPath;
@@ -766,6 +768,38 @@ pub mod test {
             // Pad to fill the chunk size
             chunk.push_str(&pattern_char.to_string().repeat(chunk_size - chunk.len()));
             file.write_all(chunk.as_bytes()).unwrap();
+        }
+    }
+
+    /// Assert that two files share physical extents (fast-reflinked-check).
+    /// For small files (< 4096 bytes), inline extents are acceptable and won't panic.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn assert_fast_reflink_check(path1: &std::path::Path, path2: &std::path::Path, content_len: usize) {
+        let result = fast_check_reflinked(
+            path1.to_str().unwrap(),
+            path2.to_str().unwrap(),
+        )
+        .expect("fast_check_reflinked should not return an IO error");
+        match result {
+            CheckResult::Reflinked(n) => {
+                assert!(n > 0, "After safe dedupe, files should share at least one extent");
+                println!("fast-reflinked-check OK: files share {} extent(s) after safe dedupe", n);
+            }
+            CheckResult::NotReflinked(reason) => {
+                if content_len >= 4096 {
+                    panic!(
+                        "After safe dedupe, files should share extents (size={} bytes), got: {}",
+                        content_len,
+                        reason
+                    );
+                } else {
+                    println!(
+                        "fast-reflinked-check: small file ({} bytes) not sharing extents ({}), acceptable",
+                        content_len,
+                        reason
+                    );
+                }
+            }
         }
     }
 
@@ -1091,6 +1125,9 @@ pub mod test {
             assert!(file_path_2.exists());
             assert_eq!(read_file(&file_path_1), content);
             assert_eq!(read_file(&file_path_2), content);
+
+            // Use fast-reflinked-check to verify files actually share physical extents
+            assert_fast_reflink_check(&file_path_1, &file_path_2, content.len());
         })
     }
 
@@ -1214,8 +1251,8 @@ pub mod test {
             let mtime_old2 = FileTime::from_last_modification_time(&meta_old2);
             let ctime_old2 = meta_old2.created().ok();
 
-            // Sleep 0.1s to ensure any new file write would have a later timestamp
-            thread::sleep(Duration::from_millis(100));
+            // Sleep 0.01s to ensure any new file write would have a later timestamp
+            thread::sleep(Duration::from_millis(10));
 
             // Write a new file_path_3 and read its mtime (mtime3)
             write_file(&file_path_3, content);
@@ -1288,6 +1325,9 @@ pub mod test {
             // Also verify content is still correct
             assert_eq!(read_file(&file_path_1), content);
             assert_eq!(read_file(&file_path_2), content);
+
+            // Use fast-reflinked-check to verify files actually share physical extents
+            assert_fast_reflink_check(&file_path_1, &file_path_2, content.len());
         })
     }
 

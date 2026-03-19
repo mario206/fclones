@@ -752,6 +752,22 @@ pub enum Command {
         /// Shell for which the completion script is generated.
         shell: clap_complete::Shell,
     },
+
+    /// Check if two files share physical extents (reflink detection).
+    ///
+    /// Uses the FIEMAP ioctl to compare physical extents of two files.
+    /// Exit code: 0 = YES (reflinked), 1 = NO, 2 = error.
+    /// Linux only.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ReflinkedCheck {
+        /// First file to check.
+        #[arg()]
+        file1: PathBuf,
+
+        /// Second file to check.
+        #[arg()]
+        file2: PathBuf,
+    },
 }
 
 impl Command {
